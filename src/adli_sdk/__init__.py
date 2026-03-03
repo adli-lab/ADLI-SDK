@@ -58,6 +58,24 @@ class ADLI:
     # instrument — plug into OTel pipeline
     # ------------------------------------------------------------------
 
+    def instrument_openai_agents(self) -> None:
+        """Register :class:`ADLIAgentsProcessor` into the OpenAI Agents SDK global trace pipeline.
+
+        Safe to call multiple times — only registers once.
+        """
+        if getattr(self, "_openai_agents_instrumented", False):
+            return
+        try:
+            from agents.tracing import add_trace_processor
+
+            from adli_sdk.openai_agents_processor import ADLIAgentsProcessor
+
+            add_trace_processor(ADLIAgentsProcessor(client=self._client, project_id=self._project_id))
+            self._openai_agents_instrumented = True
+            logger.info("ADLIAgentsProcessor registered in OpenAI Agents SDK")
+        except ImportError:
+            logger.warning("openai-agents not installed — instrument_openai_agents() is a no-op")
+
     def instrument(self) -> None:
         """Add :class:`ADLISpanProcessor` to the global OTel ``TracerProvider``.
 

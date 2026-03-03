@@ -42,12 +42,14 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
         agent_name: str,
         adli_trace_id: str,
         user_message: str,
+        framework: str = "langchain",
     ) -> None:
         self._client = client
         self._project_id = project_id
         self._agent_name = agent_name
         self._adli_trace_id = adli_trace_id
         self._user_message = user_message
+        self._framework = framework
 
         self._lock = threading.Lock()
         self._messages: list[Message] = [
@@ -248,7 +250,7 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
             request = LearnRequest(
                 agent_name=self._agent_name,
                 project_id=self._project_id,
-                framework="langchain",
+                framework=self._framework,
                 adli_trace_id=self._adli_trace_id,
                 user_message=self._user_message,
                 injected=bool(self._adli_trace_id),
