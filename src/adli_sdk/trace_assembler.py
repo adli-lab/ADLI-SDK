@@ -46,6 +46,37 @@ class TraceAssembler:
             raw_messages = []
 
         messages = _parse_pydantic_ai_messages(raw_messages)
+
+        # Inject system prompt from gen_ai.system_instructions if not already
+        # present in messages (OTel/Logfire stores it separately from
+        # pydantic_ai.all_messages).
+        if not any(
+            p.part_kind == "system-prompt"
+            for m in messages
+            for p in m.parts
+        ):
+            sys_parts = _extract_system_prompt_parts(self.root_span_attrs)
+            if sys_parts:
+                # Prepend as the first message or merge into existing first
+                # request message so the UI sees SYSTEM-PROMPT first.
+                if messages and messages[0].kind == "request":
+                    messages[0].parts = sys_parts + messages[0].parts
+                else:
+                    messages.insert(
+                        0, Message(kind="request", parts=sys_parts)
+                    )
+
+        # Extract model_name from root span for response messages that lack it
+        model_name = (
+            self.root_span_attrs.get("gen_ai.response.model")
+            or self.root_span_attrs.get("model_name")
+            or self.root_span_attrs.get("gen_ai.request.model")
+        )
+        if model_name:
+            for m in messages:
+                if m.kind == "response" and not getattr(m, "model_name", None):
+                    m.model_name = str(model_name)  # type: ignore[attr-defined]
+
         usage = _extract_usage(self.root_span_attrs)
 
         # Count tool calls from parsed messages (normalised to "tool-call")
@@ -114,7 +145,7 @@ def _extract_part_content(part: dict[str, Any], part_type: str) -> str | None:
     if content is not None:
         return str(content) if not isinstance(content, str) else content
 
-    # tool_call / tool-call → synthesise "name(arguments)"
+    # tool_call / tool-call → use result field if present, otherwise synthesise
     if part_type in ("tool_call", "tool-call"):
         name = part.get("name", "")
         args = part.get("arguments", part.get("args", ""))
@@ -130,6 +161,35 @@ def _extract_part_content(part: dict[str, Any], part_type: str) -> str | None:
     return None
 
 
+def _build_part(part: dict[str, Any], raw_type: str) -> MessagePart:
+    """Build a MessagePart preserving tool_name, args, tool_call_id for the frontend."""
+    content = _extract_part_content(part, raw_type)
+    part_kind = _PART_TYPE_NORMALISE.get(raw_type, raw_type)
+
+    extra: dict[str, Any] = {}
+
+    if raw_type in ("tool_call", "tool-call"):
+        name = part.get("name", "")
+        if name:
+            extra["tool_name"] = name
+        args = part.get("arguments", part.get("args", ""))
+        if args:
+            extra["args"] = args
+        call_id = part.get("id") or part.get("tool_call_id")
+        if call_id:
+            extra["tool_call_id"] = str(call_id)
+
+    elif raw_type in ("tool_call_response", "tool-call-response", "tool-return", "tool_return"):
+        name = part.get("name", "")
+        if name:
+            extra["tool_name"] = name
+        call_id = part.get("id") or part.get("tool_call_id")
+        if call_id:
+            extra["tool_call_id"] = str(call_id)
+
+    return MessagePart(part_kind=part_kind, content=content, **extra)
+
+
 def _parse_pydantic_ai_messages(raw: list[dict]) -> list[Message]:
     """Parse PydanticAI OTel GenAI spec messages (role/type format)."""
     messages = []
@@ -142,10 +202,7 @@ def _parse_pydantic_ai_messages(raw: list[dict]) -> list[Message]:
         for p in msg.get("parts", []):
             # OTel format uses "type"; legacy uses "part_kind"
             raw_type = p.get("type") or p.get("part_kind", "text")
-            content = _extract_part_content(p, raw_type)
-            # Normalise to ADLI-standard names (tool-call, tool-return, …)
-            part_kind = _PART_TYPE_NORMALISE.get(raw_type, raw_type)
-            parts.append(MessagePart(part_kind=part_kind, content=content))
+            parts.append(_build_part(p, raw_type))
 
         messages.append(
             Message(
@@ -193,6 +250,38 @@ def _parse_genai_messages(raw: Any, source: str) -> list[Message]:
         messages.append(Message(kind=kind, parts=parts))
 
     return messages
+
+
+def _extract_system_prompt_parts(attrs: dict[str, Any]) -> list[MessagePart]:
+    """Extract system prompt from gen_ai.system_instructions span attribute.
+
+    PydanticAI/Logfire stores the system prompt separately from
+    ``pydantic_ai.all_messages``.  The attribute is either a JSON string
+    or a list of dicts with ``{"type": "text", "content": "..."}``.
+    """
+    raw = attrs.get("gen_ai.system_instructions")
+    if not raw:
+        return []
+
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # Plain string — treat as the system prompt text itself
+            return [MessagePart(part_kind="system-prompt", content=raw)]
+
+    if isinstance(raw, list):
+        parts: list[MessagePart] = []
+        for item in raw:
+            if isinstance(item, dict):
+                content = item.get("content", "")
+                if content:
+                    parts.append(MessagePart(part_kind="system-prompt", content=str(content)))
+            elif isinstance(item, str) and item:
+                parts.append(MessagePart(part_kind="system-prompt", content=item))
+        return parts
+
+    return []
 
 
 def _extract_usage(attrs: dict[str, Any]) -> Usage:
