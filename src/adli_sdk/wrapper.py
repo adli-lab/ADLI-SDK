@@ -132,6 +132,16 @@ class ADLIWrapper:
 
             return sync_wrapper
 
+        if method_name == "iter":
+
+            @functools.wraps(method)
+            def iter_wrapper(user_prompt: Any = None, *args: Any, **kwargs: Any) -> Any:
+                return _IterContextWrapper(
+                    client, agent_name, method, user_prompt, args, kwargs
+                )
+
+            return iter_wrapper
+
         @functools.wraps(method)
         async def async_wrapper(user_prompt: Any = None, *args: Any, **kwargs: Any) -> Any:
             if user_prompt is not None and isinstance(user_prompt, str):
@@ -356,6 +366,56 @@ class ADLIWrapper:
             return result
 
         return sync_wrapper
+
+
+# ---------------------------------------------------------------------------
+# Async context manager wrapper for pydantic-ai iter()
+# ---------------------------------------------------------------------------
+
+
+class _IterContextWrapper:
+    """Async context manager that injects the ADLI prompt before entering iter().
+
+    pydantic-ai's ``Agent.iter()`` is a synchronous method returning an async
+    context manager.  We cannot ``await`` it, so we wrap it to perform inject
+    inside ``__aenter__`` and then delegate to the real context manager.
+    """
+
+    def __init__(
+        self,
+        client: ADLIClient,
+        agent_name: str,
+        method: Callable,
+        user_prompt: Any,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        self._client = client
+        self._agent_name = agent_name
+        self._method = method
+        self._user_prompt = user_prompt
+        self._args = args
+        self._kwargs = kwargs
+        self._cm: Any = None
+
+    async def __aenter__(self) -> Any:
+        user_prompt = self._user_prompt
+        kwargs = dict(self._kwargs)
+        if user_prompt is not None and isinstance(user_prompt, str):
+            inj = await self._client.ainject(user_prompt, self._agent_name)
+            user_prompt = inj.message
+            meta = kwargs.get("metadata") or {}
+            meta["adli_trace_id"] = inj.adli_trace_id
+            meta["adli_agent_name"] = self._agent_name
+            meta["adli_user_message"] = inj.message if inj.injected else self._user_prompt
+            kwargs["metadata"] = meta
+        self._cm = self._method(user_prompt, *self._args, **kwargs)
+        return await self._cm.__aenter__()
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        if self._cm is not None:
+            return await self._cm.__aexit__(*exc_info)
+        return False
 
 
 # ---------------------------------------------------------------------------
