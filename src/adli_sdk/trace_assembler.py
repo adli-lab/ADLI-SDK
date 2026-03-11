@@ -46,6 +46,7 @@ class TraceAssembler:
             raw_messages = []
 
         messages = _parse_pydantic_ai_messages(raw_messages)
+        messages = _interleave_tool_pairs(messages)
 
         # Inject system prompt from gen_ai.system_instructions if not already
         # present in messages (OTel/Logfire stores it separately from
@@ -145,13 +146,6 @@ def _extract_part_content(part: dict[str, Any], part_type: str) -> str | None:
     if content is not None:
         return str(content) if not isinstance(content, str) else content
 
-    # tool_call / tool-call → use result field if present, otherwise synthesise
-    if part_type in ("tool_call", "tool-call"):
-        name = part.get("name", "")
-        args = part.get("arguments", part.get("args", ""))
-        if name or args:
-            return f"{name}({args})" if name else str(args)
-
     # tool_call_response / tool-return → use result
     if part_type in ("tool_call_response", "tool-call-response", "tool-return", "tool_return"):
         result = part.get("result")
@@ -161,9 +155,20 @@ def _extract_part_content(part: dict[str, Any], part_type: str) -> str | None:
     return None
 
 
+def _decode_args(raw_args: Any) -> str:
+    """Re-encode JSON args with readable unicode (no \\uXXXX escapes)."""
+    if not raw_args:
+        return ""
+    s = str(raw_args)
+    try:
+        parsed = json.loads(s)
+        return json.dumps(parsed, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        return s
+
+
 def _build_part(part: dict[str, Any], raw_type: str) -> MessagePart:
     """Build a MessagePart preserving tool_name, args, tool_call_id for the frontend."""
-    content = _extract_part_content(part, raw_type)
     part_kind = _PART_TYPE_NORMALISE.get(raw_type, raw_type)
 
     extra: dict[str, Any] = {}
@@ -172,21 +177,27 @@ def _build_part(part: dict[str, Any], raw_type: str) -> MessagePart:
         name = part.get("name", "")
         if name:
             extra["tool_name"] = name
-        args = part.get("arguments", part.get("args", ""))
+        args = _decode_args(part.get("arguments", part.get("args", "")))
         if args:
             extra["args"] = args
         call_id = part.get("id") or part.get("tool_call_id")
         if call_id:
             extra["tool_call_id"] = str(call_id)
+        # Don't set content — frontend builds display from tool_name + args
+        return MessagePart(part_kind=part_kind, content=None, **extra)
 
-    elif raw_type in ("tool_call_response", "tool-call-response", "tool-return", "tool_return"):
+    if raw_type in ("tool_call_response", "tool-call-response", "tool-return", "tool_return"):
         name = part.get("name", "")
         if name:
             extra["tool_name"] = name
         call_id = part.get("id") or part.get("tool_call_id")
         if call_id:
             extra["tool_call_id"] = str(call_id)
+        content = _extract_part_content(part, raw_type)
+        return MessagePart(part_kind=part_kind, content=content, **extra)
 
+    # All other part types — text, system-prompt, user-prompt, thinking, etc.
+    content = _extract_part_content(part, raw_type)
     return MessagePart(part_kind=part_kind, content=content, **extra)
 
 
@@ -250,6 +261,101 @@ def _parse_genai_messages(raw: Any, source: str) -> list[Message]:
         messages.append(Message(kind=kind, parts=parts))
 
     return messages
+
+
+def _interleave_tool_pairs(messages: list[Message]) -> list[Message]:
+    """Re-order messages so each tool-call is immediately followed by its return.
+
+    PydanticAI batches parallel tool calls into a single response message
+    with N tool-call parts, followed by a single request message with N
+    tool-return parts.  The frontend links call↔return positionally
+    (first TOOL-CALL → next TOOL-RETURN), which breaks on batches.
+
+    This function splits batch messages into individual call/return pairs
+    matched by ``tool_call_id``, producing: TC1,TR1, TC2,TR2, …
+    """
+    result: list[Message] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        call_parts = [p for p in msg.parts if p.part_kind == "tool-call"]
+        other_parts = [p for p in msg.parts if p.part_kind != "tool-call"]
+
+        # Not a batch tool-call message — emit as-is
+        if len(call_parts) <= 1:
+            result.append(msg)
+            i += 1
+            continue
+
+        # Emit any non-tool-call parts (e.g. text) first
+        if other_parts:
+            result.append(
+                Message(kind=msg.kind, parts=other_parts, timestamp=msg.timestamp)
+            )
+
+        # Look ahead for the matching return message
+        return_msg: Message | None = None
+        if i + 1 < len(messages):
+            candidate = messages[i + 1]
+            if any(p.part_kind == "tool-return" for p in candidate.parts):
+                return_msg = candidate
+
+        # Build a map of tool_call_id → return part for matching
+        return_by_id: dict[str, MessagePart] = {}
+        positional_returns: list[MessagePart] = []
+        if return_msg:
+            for rp in return_msg.parts:
+                if rp.part_kind != "tool-return":
+                    continue
+                tcid = getattr(rp, "tool_call_id", None)
+                if tcid:
+                    return_by_id[tcid] = rp
+                else:
+                    positional_returns.append(rp)
+
+        # Emit interleaved pairs, track which returns we've used
+        emitted_returns: set[int] = set()  # track by id() to avoid duplicates
+        for cp in call_parts:
+            result.append(
+                Message(kind=msg.kind, parts=[cp], timestamp=msg.timestamp)
+            )
+            # Match by tool_call_id first, then positional
+            tcid = getattr(cp, "tool_call_id", None)
+            matched: MessagePart | None = None
+            if tcid and tcid in return_by_id:
+                matched = return_by_id[tcid]
+            elif positional_returns:
+                matched = positional_returns.pop(0)
+
+            if matched and return_msg:
+                emitted_returns.add(id(matched))
+                result.append(
+                    Message(
+                        kind=return_msg.kind,
+                        parts=[matched],
+                        timestamp=return_msg.timestamp,
+                    )
+                )
+
+        # Emit any unmatched return/non-return parts from the return message
+        if return_msg:
+            leftover = [
+                p for p in return_msg.parts
+                if id(p) not in emitted_returns
+            ]
+            if leftover:
+                result.append(
+                    Message(
+                        kind=return_msg.kind,
+                        parts=leftover,
+                        timestamp=return_msg.timestamp,
+                    )
+                )
+            i += 2  # skip both call and return messages
+        else:
+            i += 1
+
+    return result
 
 
 def _extract_system_prompt_parts(attrs: dict[str, Any]) -> list[MessagePart]:
