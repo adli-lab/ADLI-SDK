@@ -12,7 +12,8 @@ from typing import Any
 from uuid import UUID
 
 from adli_sdk.client import ADLIClient
-from adli_sdk.models import AgentTrace, LearnRequest, Message, MessagePart, Usage
+from adli_sdk.flush_helpers import build_learn_request, interleave_tool_pairs
+from adli_sdk.models import AgentTrace, Message, MessagePart, Usage
 
 logger = logging.getLogger("adli_sdk")
 
@@ -62,7 +63,7 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
         self._outcome: str = "success"
         self._root_run_id: UUID | None = None
         self._finished = False
-        self._system_prompt_captured = False
+        self._last_system_prompt: str | None = None
 
     # ------------------------------------------------------------------
     # Chain lifecycle — track root run for flush
@@ -120,21 +121,25 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
         **kwargs: Any,
     ) -> None:
         with self._lock:
-            if self._system_prompt_captured:
-                return
-            self._system_prompt_captured = True
             for msg_batch in messages:
                 for msg in msg_batch:
-                    msg_type = getattr(msg, "type", "")
-                    if msg_type == "system":
-                        content = getattr(msg, "content", "")
-                        self._messages.insert(
-                            0,
-                            Message(
-                                kind="request",
-                                parts=[MessagePart(part_kind="system-prompt", content=str(content))],
-                            ),
-                        )
+                    if getattr(msg, "type", "") != "system":
+                        continue
+                    content = str(getattr(msg, "content", ""))
+                    if not content or content == self._last_system_prompt:
+                        continue
+                    self._last_system_prompt = content
+                    self._messages.append(
+                        Message(
+                            kind="request",
+                            parts=[
+                                MessagePart(
+                                    part_kind="system-prompt",
+                                    content=content,
+                                ),
+                            ],
+                        ),
+                    )
 
     # ------------------------------------------------------------------
     # LLM completion — capture AI responses and usage
@@ -158,11 +163,54 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
                 tool_calls = getattr(msg, "tool_calls", []) if msg else []
 
                 parts: list[MessagePart] = []
-                if content:
-                    parts.append(MessagePart(part_kind="text", content=str(content)))
+                # Use content_blocks when available (extended-thinking models)
+                content_blocks = getattr(msg, "content_blocks", None) if msg else None
+                if content_blocks and isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type", "")
+                        if btype in ("reasoning", "thinking"):
+                            text = (
+                                block.get("reasoning")
+                                or block.get("thinking")
+                                or block.get("content", "")
+                            )
+                            if text:
+                                parts.append(MessagePart(part_kind="thinking", content=str(text)))
+                        elif btype == "text":
+                            text = block.get("text") or block.get("content", "")
+                            if text:
+                                parts.append(MessagePart(part_kind="text", content=str(text)))
+                else:
+                    # Fallback: check additional_kwargs.reasoning_content (OpenRouter, etc.)
+                    addl = (getattr(msg, "additional_kwargs", {}) or {}) if msg else {}
+                    reasoning = (
+                        addl.get("reasoning_content") or addl.get("thinking_content")
+                        if isinstance(addl, dict)
+                        else None
+                    )
+                    if reasoning:
+                        parts.append(MessagePart(part_kind="thinking", content=str(reasoning)))
+                    if content:
+                        parts.append(MessagePart(part_kind="text", content=str(content)))
+
                 for tc in tool_calls:
-                    tc_payload = {"name": tc.get("name", ""), "args": tc.get("args", {})}
-                    parts.append(MessagePart(part_kind="tool-call", content=json.dumps(tc_payload)))
+                    _name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                    _args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                    _id = (
+                        tc.get("id") or tc.get("tool_call_id")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "id", None) or getattr(tc, "tool_call_id", None)
+                    )
+                    extra: dict[str, Any] = {}
+                    if _name:
+                        extra["tool_name"] = _name
+                    if _args:
+                        extra["args"] = json.dumps(_args, ensure_ascii=False)
+                    if _id:
+                        extra["tool_call_id"] = str(_id)
+                    parts.append(MessagePart(part_kind="tool-call", content=None, **extra))
 
                 if parts:
                     self._messages.append(Message(kind="response", parts=parts))
@@ -201,18 +249,45 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
 
     def on_tool_end(
         self,
-        output: str,
+        output: Any,
         *,
         run_id: UUID,
         **kwargs: Any,
     ) -> None:
+        content, extra = self._parse_tool_output(output)
         with self._lock:
             self._messages.append(
                 Message(
                     kind="request",
-                    parts=[MessagePart(part_kind="tool-return", content=str(output))],
+                    parts=[
+                        MessagePart(
+                            part_kind="tool-return",
+                            content=content,
+                            **extra,
+                        ),
+                    ],
                 )
             )
+
+    @staticmethod
+    def _parse_tool_output(output: Any) -> tuple[str, dict[str, str]]:
+        """Extract clean content and metadata from tool output.
+
+        LangGraph's ToolNode passes ToolMessage objects with .content,
+        .name, and .tool_call_id. Plain LangChain passes strings.
+        """
+        extra: dict[str, str] = {}
+        if hasattr(output, "content"):
+            content = str(output.content)
+            name = getattr(output, "name", None)
+            tc_id = getattr(output, "tool_call_id", None)
+            if name:
+                extra["tool_name"] = str(name)
+            if tc_id:
+                extra["tool_call_id"] = str(tc_id)
+        else:
+            content = str(output)
+        return content, extra
 
     def on_tool_error(
         self,
@@ -239,24 +314,18 @@ class ADLICallbackHandler(_Base):  # type: ignore[misc]
             return
 
         try:
-            output_str = self._extract_output(outputs)
-            response_count = sum(1 for m in self._messages if m.kind == "response")
-
             trace = AgentTrace(
-                output_str=output_str,
+                output_str=self._extract_output(outputs),
                 usage=self._usage,
-                messages=self._messages,
+                messages=interleave_tool_pairs(self._messages),
             )
-            request = LearnRequest(
+            request = build_learn_request(
                 agent_name=self._agent_name,
                 project_id=self._project_id,
                 framework=self._framework,
                 adli_trace_id=self._adli_trace_id,
                 user_message=self._user_message,
-                injected=bool(self._adli_trace_id),
                 outcome=self._outcome,
-                steps_count=response_count,
-                cost_usd=None,
                 trace=trace,
             )
             self._client.learn(request)

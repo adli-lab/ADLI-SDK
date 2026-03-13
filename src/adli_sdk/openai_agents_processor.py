@@ -23,7 +23,8 @@ import threading
 from typing import Any
 
 from adli_sdk.client import ADLIClient
-from adli_sdk.models import AgentTrace, LearnRequest, Message, MessagePart, Usage
+from adli_sdk.flush_helpers import build_learn_request
+from adli_sdk.models import AgentTrace, Message, MessagePart, Usage
 
 logger = logging.getLogger("adli_sdk")
 
@@ -129,24 +130,58 @@ class ADLIAgentsProcessor(TracingProcessor):  # type: ignore[misc]
                 state.agent_name = str(getattr(data, "name", "") or "")
 
     def _collect_generation(self, data: Any, state: _TraceState) -> None:
-        for msg in getattr(data, "input", []) or []:
-            role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-            role_str = str(role)
-            kind = "response" if role_str == "assistant" else "request"
-            pk = {"system": "system-prompt", "user": "user-prompt", "assistant": "text"}.get(role_str, "text")
-            state.messages.append(
-                Message(kind=kind, parts=[MessagePart(part_kind=pk, content=str(content))])
-            )
+        # Only add input messages from the FIRST generation span.
+        # Subsequent generations re-send the full history → duplicates.
+        if state.steps_count == 0:
+            for msg in getattr(data, "input", []) or []:
+                role = str(_field(msg, "role", "user"))
+                kind = "response" if role == "assistant" else "request"
+                pk_map = {
+                    "system": "system-prompt",
+                    "user": "user-prompt",
+                    "assistant": "text",
+                }
+                pk = pk_map.get(role, "text")
+                content = str(_field(msg, "content", ""))
+                state.messages.append(
+                    Message(
+                        kind=kind,
+                        parts=[MessagePart(part_kind=pk, content=content)],
+                    )
+                )
 
         for msg in getattr(data, "output", []) or []:
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-            if content:
+            content = _field(msg, "content", "")
+            parts: list[MessagePart] = []
+
+            # Content may be a list of typed blocks or a plain string
+            if isinstance(content, list):
+                self._parse_content_blocks(content, parts, state)
+            elif content:
                 text = str(content)
-                state.messages.append(
-                    Message(kind="response", parts=[MessagePart(part_kind="text", content=text)])
-                )
+                parts.append(MessagePart(part_kind="text", content=text))
                 state.output_str = text
+
+            # Extract tool_calls from output message (OpenAI format)
+            raw_tcs = _field(msg, "tool_calls", []) or []
+            for tc in raw_tcs:
+                tc_extra: dict[str, Any] = {}
+                func = _field(tc, "function", {})
+                name = _field(func, "name", "")
+                raw_args = _field(func, "arguments", "")
+                tc_id = _field(tc, "id", "")
+                if name:
+                    tc_extra["tool_name"] = str(name)
+                if raw_args:
+                    tc_extra["args"] = str(raw_args)
+                if tc_id:
+                    tc_extra["tool_call_id"] = str(tc_id)
+                parts.append(
+                    MessagePart(part_kind="tool-call", content=None, **tc_extra)
+                )
+
+            if parts:
+                state.messages.append(Message(kind="response", parts=parts))
 
         usage = getattr(data, "usage", None)
         if usage:
@@ -154,6 +189,44 @@ class ADLIAgentsProcessor(TracingProcessor):  # type: ignore[misc]
             state.usage.output_tokens += getattr(usage, "output_tokens", 0) or 0
             state.usage.requests += 1
             state.steps_count += 1
+
+    @staticmethod
+    def _parse_content_blocks(
+        blocks: list, parts: list[MessagePart], state: _TraceState
+    ) -> None:
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype in ("thinking", "reasoning"):
+                thinking_text = (
+                    block.get("thinking")
+                    or block.get("reasoning")
+                    or block.get("content", "")
+                )
+                if thinking_text:
+                    parts.append(
+                        MessagePart(part_kind="thinking", content=str(thinking_text))
+                    )
+            elif btype == "text":
+                text = block.get("text") or block.get("content", "")
+                if text:
+                    parts.append(MessagePart(part_kind="text", content=str(text)))
+                    state.output_str = str(text)
+            elif btype == "tool_use":
+                extra: dict[str, Any] = {}
+                name = block.get("name", "")
+                if name:
+                    extra["tool_name"] = name
+                args = block.get("input", "")
+                if args:
+                    extra["args"] = str(args) if not isinstance(args, str) else args
+                tc_id = block.get("id", "")
+                if tc_id:
+                    extra["tool_call_id"] = str(tc_id)
+                parts.append(
+                    MessagePart(part_kind="tool-call", content=None, **extra)
+                )
 
     def _collect_function(self, data: Any, state: _TraceState) -> None:
         name = str(getattr(data, "name", "") or "")
@@ -178,18 +251,22 @@ class ADLIAgentsProcessor(TracingProcessor):  # type: ignore[misc]
                 usage=state.usage,
                 messages=state.messages,
             )
-            request = LearnRequest(
+            request = build_learn_request(
                 agent_name=state.agent_name or "unknown",
                 project_id=self._project_id,
                 framework="openai_agents",
                 adli_trace_id=state.adli_trace_id,
                 user_message=state.user_message,
-                injected=bool(state.adli_trace_id),
                 outcome=state.outcome,
-                steps_count=state.steps_count,
-                cost_usd=None,
                 trace=trace,
             )
             self._client.learn(request)
         except Exception:
             logger.warning("Failed to flush OpenAI Agents trace to ADLI /learn", exc_info=True)
+
+
+def _field(obj: Any, key: str, default: Any = "") -> Any:
+    """Extract a field from a dict or object."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)

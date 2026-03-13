@@ -5,12 +5,14 @@ query/chat call, then removed and manually flushed after the call returns.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from typing import Any
 
 from adli_sdk.client import ADLIClient
-from adli_sdk.models import AgentTrace, LearnRequest, Message, MessagePart, Usage
+from adli_sdk.flush_helpers import build_learn_request
+from adli_sdk.models import AgentTrace, Message, MessagePart, Usage
 
 logger = logging.getLogger("adli_sdk")
 
@@ -78,14 +80,20 @@ class ADLILlamaIndexHandler(_LIBase):  # type: ignore[misc]
                 if not self._system_prompt_captured:
                     self._system_prompt_captured = True
                     for msg in payload.get("messages", []):
-                        role = getattr(getattr(msg, "role", None), "value", str(getattr(msg, "role", "")))
+                        raw_role = getattr(msg, "role", None)
+                        role = getattr(raw_role, "value", str(raw_role or ""))
                         if role == "system":
                             content = getattr(msg, "content", "")
                             self._messages.insert(
                                 0,
                                 Message(
                                     kind="request",
-                                    parts=[MessagePart(part_kind="system-prompt", content=str(content))],
+                                    parts=[
+                                        MessagePart(
+                                            part_kind="system-prompt",
+                                            content=str(content),
+                                        ),
+                                    ],
                                 ),
                             )
                             break
@@ -146,13 +154,43 @@ class ADLILlamaIndexHandler(_LIBase):  # type: ignore[misc]
             tool_calls = additional.get("tool_calls", [])
 
         parts: list[MessagePart] = []
+        # Extract thinking/reasoning from additional_kwargs (extended-thinking models)
+        if msg:
+            additional = getattr(msg, "additional_kwargs", {}) or {}
+            if isinstance(additional, dict):
+                reasoning = (
+                    additional.get("reasoning_content")
+                    or additional.get("thinking_content")
+                )
+                if reasoning:
+                    parts.append(MessagePart(part_kind="thinking", content=str(reasoning)))
         if text:
             parts.append(MessagePart(part_kind="text", content=str(text)))
         for tc in tool_calls:
-            func = getattr(tc, "function", None) or (tc if isinstance(tc, dict) else {})
-            name = getattr(func, "name", "") or (func.get("name", "") if isinstance(func, dict) else "")
-            args = getattr(func, "arguments", "") or (func.get("arguments", "") if isinstance(func, dict) else "")
-            parts.append(MessagePart(part_kind="tool-call", content=f'{{"name": "{name}", "args": {args}}}'))
+            func = getattr(tc, "function", None) or (
+                tc if isinstance(tc, dict) else {}
+            )
+            name = getattr(func, "name", "") or (
+                func.get("name", "") if isinstance(func, dict) else ""
+            )
+            raw_args = getattr(func, "arguments", "") or (
+                func.get("arguments", "")
+                if isinstance(func, dict)
+                else ""
+            )
+            tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+            extra: dict[str, Any] = {}
+            if name:
+                extra["tool_name"] = name
+            if raw_args:
+                try:
+                    parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    extra["args"] = json.dumps(parsed, ensure_ascii=False)
+                except (json.JSONDecodeError, TypeError):
+                    extra["args"] = str(raw_args)
+            if tc_id:
+                extra["tool_call_id"] = str(tc_id)
+            parts.append(MessagePart(part_kind="tool-call", content=None, **extra))
 
         if parts:
             self._messages.append(Message(kind="response", parts=parts))
@@ -184,22 +222,18 @@ class ADLILlamaIndexHandler(_LIBase):  # type: ignore[misc]
             return
 
         try:
-            response_count = sum(1 for m in self._messages if m.kind == "response")
             trace = AgentTrace(
                 output_str=output_str,
                 usage=self._usage,
                 messages=self._messages,
             )
-            request = LearnRequest(
+            request = build_learn_request(
                 agent_name=self._agent_name,
                 project_id=self._project_id,
                 framework="llama_index",
                 adli_trace_id=self._adli_trace_id,
                 user_message=self._user_message,
-                injected=bool(self._adli_trace_id),
                 outcome=outcome,
-                steps_count=response_count,
-                cost_usd=None,
                 trace=trace,
             )
             self._client.learn(request)

@@ -70,7 +70,8 @@ class ADLI:
 
             from adli_sdk.openai_agents_processor import ADLIAgentsProcessor
 
-            add_trace_processor(ADLIAgentsProcessor(client=self._client, project_id=self._project_id))
+            proc = ADLIAgentsProcessor(client=self._client, project_id=self._project_id)
+            add_trace_processor(proc)
             self._openai_agents_instrumented = True
             logger.info("ADLIAgentsProcessor registered in OpenAI Agents SDK")
         except ImportError:

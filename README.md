@@ -2,10 +2,10 @@
 
 Official Python SDK for [ADLI](https://adli.dev) — runtime strategy learning for AI agents.
 
-ADLI makes your agents smarter with every run. The SDK does two things:
+ADLI makes your agents smarter with every run:
 
 1. **Inject** — before each run, checks if there's a relevant strategy and modifies the user message.
-2. **Learn** — after each run, captures the full conversation trace and sends it to ADLI for strategy evolution.
+2. **Learn** — after each run, captures the full conversation trace (messages, tool calls, reasoning, usage) and sends it to ADLI for strategy evolution.
 
 ## Installation
 
@@ -14,8 +14,6 @@ pip install adli-sdk
 ```
 
 ## Quick Start
-
-Three lines added to your existing code: `ADLI(...)`, `.instrument()` (PydanticAI only), `.wrap(...)`.
 
 ### PydanticAI
 
@@ -34,22 +32,83 @@ agent = adli.wrap(agent, agent_name="sql-agent")
 result = await agent.run("Get all customers with outstanding debt")
 ```
 
-### LangChain / LangGraph
+### LangChain
 
 ```python
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
 from adli_sdk import ADLI
+
+@tool
+def lookup_schema(table_name: str) -> str:
+    """Look up the database schema for a table."""
+    return f"{table_name}(id, name, created_at)"
 
 adli = ADLI(token="adli-xxx", project_id=1)
 
-chain = ChatPromptTemplate.from_template("Translate to French: {input}") | ChatOpenAI(model="gpt-4o")
-chain = adli.wrap(chain, agent_name="translator")
+model = ChatOpenAI(model="gpt-4o")
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a senior SQL analyst. Use tools to check table structures."),
+    ("human", "{input}"),
+    MessagesPlaceholder("agent_scratchpad"),
+])
+agent = create_tool_calling_agent(model, [lookup_schema], prompt)
+executor = AgentExecutor(agent=agent, tools=[lookup_schema])
 
-result = chain.invoke("Hello, how are you?")
+executor = adli.wrap(executor, agent_name="sql-agent")
+result = executor.invoke({"input": "What's the schema of the customers table?"})
 ```
 
-LangGraph compiled graphs work identically — `create_react_agent(...)` returns a `Runnable`, so `adli.wrap(agent, ...)` works as-is.
+### LangGraph
+
+Multi-node `StateGraph` with tools, conditional edges, and tool loops — works the same way. Pass `input_key="messages"` for `MessagesState`.
+
+```python
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+from adli_sdk import ADLI
+
+@tool
+def search_docs(query: str) -> str:
+    """Search documentation."""
+    return f"Results for '{query}'..."
+
+model = ChatOpenAI(model="gpt-4o")
+tools = [search_docs]
+
+def researcher(state: MessagesState) -> dict:
+    sys = SystemMessage(content="You are a researcher. Use tools to gather info.")
+    return {"messages": [model.bind_tools(tools).invoke([sys] + state["messages"])]}
+
+def synthesizer(state: MessagesState) -> dict:
+    sys = SystemMessage(content="Summarize all findings into a final answer.")
+    return {"messages": [model.invoke([sys] + state["messages"])]}
+
+builder = StateGraph(MessagesState)
+builder.add_node("researcher", researcher)
+builder.add_node("tools", ToolNode(tools))
+builder.add_node("synthesizer", synthesizer)
+builder.add_edge(START, "researcher")
+builder.add_conditional_edges("researcher", tools_condition, {"tools": "tools", "__end__": "synthesizer"})
+builder.add_edge("tools", "researcher")
+builder.add_edge("synthesizer", END)
+graph = builder.compile()
+
+adli = ADLI(token="adli-xxx", project_id=1)
+graph = adli.wrap(graph, agent_name="research-agent", input_key="messages")
+
+result = graph.invoke({
+    "messages": [HumanMessage(content="Search for auth docs and summarize.")],
+})
+```
+
+ADLI captures the full graph execution: system prompts from each node, all LLM responses, tool calls with arguments, tool returns with results — correctly interleaved and paired by `tool_call_id`.
 
 ### CrewAI
 
@@ -89,11 +148,10 @@ from agents import Agent, Runner, RunConfig
 from adli_sdk import ADLI
 
 adli = ADLI(token="adli-xxx", project_id=1)
-adli.instrument_openai_agents()  # register once at startup
+adli.instrument_openai_agents()
 
 agent = Agent(name="assistant", instructions="You are a helpful assistant.", tools=[...])
 
-# inject manually, then run
 inj = adli.inject("user query", agent_name="assistant")
 result = await Runner.run(
     agent,
@@ -105,18 +163,6 @@ result = await Runner.run(
     }),
 )
 ```
-
----
-
-## Already using an observability tool?
-
-ADLI does not replace or interfere with your existing tracing setup. Both work side by side.
-
-- **Logfire**: call `logfire.configure()` before `Agent.instrument_all()` — traces go to both.
-- **LangFuse**: add `LangfuseCallbackHandler()` to your chain's `config={"callbacks": [...]}` — runs alongside ADLI's handler.
-- **LangSmith**: set `LANGCHAIN_TRACING_V2=true` as usual — ADLI's callback handler works independently.
-
-ADLI never depends on these tools and never interferes with them.
 
 ---
 
@@ -156,17 +202,37 @@ result = chain.invoke({"input": inj.message}, config={"callbacks": [handler]})
 
 ---
 
+## Works Alongside Your Observability Stack
+
+ADLI does not replace or interfere with your existing tracing setup:
+
+- **Logfire**: call `logfire.configure()` before `Agent.instrument_all()` — traces go to both.
+- **LangFuse**: add `LangfuseCallbackHandler()` to your chain's `config={"callbacks": [...]}` — runs alongside ADLI's handler.
+- **LangSmith**: set `LANGCHAIN_TRACING_V2=true` as usual — ADLI's callback handler works independently.
+
+---
+
 ## How It Works
 
-| Framework | Mechanism | ADLI component |
-|-----------|-----------|----------------|
-| PydanticAI | OTel spans via `instrument_all()` | `ADLISpanProcessor` |
-| LangChain / LangGraph | LangChain callbacks | `ADLICallbackHandler` |
-| CrewAI | LLM-level callbacks | `ADLICallbackHandler` (reused) |
-| LlamaIndex | `CallbackManager` events | `ADLILlamaIndexHandler` |
-| OpenAI Agents SDK | `TracingProcessor` | `ADLIAgentsProcessor` |
+| Framework | Trace mechanism | Intercepted methods |
+|---|---|---|
+| PydanticAI | OTel `SpanProcessor` | `run`, `run_sync`, `run_stream`, `iter` |
+| LangChain / LangGraph | `BaseCallbackHandler` | `invoke`, `ainvoke`, `stream`, `astream` |
+| CrewAI | LangChain callbacks (reused) | `kickoff`, `kickoff_async` |
+| LlamaIndex | `CallbackManager` events | `query`, `aquery`, `chat`, `achat` |
+| OpenAI Agents SDK | `TracingProcessor` | Manual inject + `Runner.run` |
 
-The `wrap()` method creates a transparent `__getattr__` proxy. All attributes and methods are delegated to the original object. Only entry points (`run` / `invoke` / `kickoff` / `query` etc.) are intercepted to call `/inject` and attach the trace collection mechanism.
+`wrap()` creates a transparent `__getattr__` proxy — all attributes and methods delegate to the original object. Only entry-point methods are intercepted to call `/inject` and attach trace collection.
+
+### What Gets Captured
+
+- System prompts (including per-node prompts in LangGraph)
+- User messages
+- LLM responses (text + reasoning/thinking content)
+- Tool calls (name, arguments, tool_call_id)
+- Tool returns (result, matched to call by tool_call_id)
+- Token usage (input, output, cache)
+- Outcome (success/failure)
 
 ## License
 

@@ -16,7 +16,7 @@ from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.trace import StatusCode
 
 from adli_sdk.client import ADLIClient
-from adli_sdk.models import LearnRequest
+from adli_sdk.flush_helpers import build_learn_request
 from adli_sdk.trace_assembler import TraceAssembler
 
 logger = logging.getLogger("adli_sdk")
@@ -144,9 +144,10 @@ class ADLISpanProcessor(SpanProcessor):
                 if adli_meta.get("agent_name"):
                     assembler.agent_name = str(adli_meta["agent_name"])
 
-                assembler.outcome = (
-                    "failure" if span.status and span.status.status_code == StatusCode.ERROR else "success"
+                is_error = (
+                    span.status and span.status.status_code == StatusCode.ERROR
                 )
+                assembler.outcome = "failure" if is_error else "success"
                 assembler.framework = self._detect_framework(attrs)
 
                 del self._active_traces[otel_trace_id]
@@ -169,16 +170,13 @@ class ADLISpanProcessor(SpanProcessor):
 
         try:
             agent_trace = assembler.assemble()
-            request = LearnRequest(
+            request = build_learn_request(
                 agent_name=assembler.agent_name or "unknown",
                 project_id=self._project_id,
                 framework=assembler.framework,
                 adli_trace_id=assembler.adli_trace_id,
                 user_message=assembler.user_message,
-                injected=bool(assembler.adli_trace_id),
                 outcome=assembler.outcome,
-                steps_count=len([m for m in agent_trace.messages if m.kind == "response"]),
-                cost_usd=None,
                 trace=agent_trace,
             )
             self._client.learn(request)
